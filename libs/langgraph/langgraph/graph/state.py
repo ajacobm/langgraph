@@ -22,7 +22,6 @@ from typing import (
 )
 
 from langchain_core.runnables import Runnable, RunnableConfig
-from langchain_core.runnables.base import RunnableLike
 from pydantic import BaseModel
 from pydantic.v1 import BaseModel as BaseModelV1
 from typing_extensions import Self
@@ -34,7 +33,7 @@ from langgraph.channels.dynamic_barrier_value import DynamicBarrierValue, WaitFo
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.channels.last_value import LastValue
 from langgraph.channels.named_barrier_value import NamedBarrierValue
-from langgraph.constants import EMPTY_SEQ, NS_END, NS_SEP, SELF, TAG_HIDDEN
+from langgraph.constants import EMPTY_SEQ, MISSING, NS_END, NS_SEP, SELF, TAG_HIDDEN
 from langgraph.errors import (
     ErrorCode,
     InvalidUpdateError,
@@ -60,7 +59,7 @@ from langgraph.store.base import BaseStore
 from langgraph.types import All, Checkpointer, Command, RetryPolicy
 from langgraph.utils.fields import get_field_default
 from langgraph.utils.pydantic import create_model
-from langgraph.utils.runnable import RunnableCallable, coerce_to_runnable
+from langgraph.utils.runnable import RunnableCallable, RunnableLike, coerce_to_runnable
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +90,7 @@ class StateNodeSpec(NamedTuple):
     metadata: Optional[dict[str, Any]]
     input: Type[Any]
     retry_policy: Optional[RetryPolicy]
-    ends: Optional[tuple[str, ...]] = EMPTY_SEQ
+    ends: Optional[Union[tuple[str, ...], dict[str, str]]] = EMPTY_SEQ
 
 
 class StateGraph(Graph):
@@ -106,7 +105,6 @@ class StateGraph(Graph):
         state_schema (Type[Any]): The schema class that defines the state.
         config_schema (Optional[Type[Any]]): The schema class that defines the configuration.
             Use this to expose configurable parameters in your API.
-
 
     Examples:
         >>> from langchain_core.runnables import RunnableConfig
@@ -232,6 +230,7 @@ class StateGraph(Graph):
         metadata: Optional[dict[str, Any]] = None,
         input: Optional[Type[Any]] = None,
         retry: Optional[RetryPolicy] = None,
+        destinations: Optional[Union[dict[str, str], tuple[str]]] = None,
     ) -> Self:
         """Adds a new node to the state graph.
         Will take the name of the function/runnable as the node name.
@@ -243,7 +242,7 @@ class StateGraph(Graph):
             ValueError: If the key is already being used as a state key.
 
         Returns:
-            StateGraph
+            Self: The instance of the state graph, allowing for method chaining.
         """
         ...
 
@@ -256,6 +255,7 @@ class StateGraph(Graph):
         metadata: Optional[dict[str, Any]] = None,
         input: Optional[Type[Any]] = None,
         retry: Optional[RetryPolicy] = None,
+        destinations: Optional[Union[dict[str, str], tuple[str]]] = None,
     ) -> Self:
         """Adds a new node to the state graph.
 
@@ -267,7 +267,7 @@ class StateGraph(Graph):
             ValueError: If the key is already being used as a state key.
 
         Returns:
-            StateGraph
+            Self: The instance of the state graph, allowing for method chaining.
         """
         ...
 
@@ -279,20 +279,25 @@ class StateGraph(Graph):
         metadata: Optional[dict[str, Any]] = None,
         input: Optional[Type[Any]] = None,
         retry: Optional[RetryPolicy] = None,
+        destinations: Optional[Union[dict[str, str], tuple[str]]] = None,
     ) -> Self:
         """Adds a new node to the state graph.
 
         Will take the name of the function/runnable as the node name.
 
         Args:
-            node (Union[str, RunnableLike)]: The function or runnable this node will run.
+            node (Union[str, RunnableLike]): The function or runnable this node will run.
             action (Optional[RunnableLike]): The action associated with the node. (default: None)
             metadata (Optional[dict[str, Any]]): The metadata associated with the node. (default: None)
             input (Optional[Type[Any]]): The input schema for the node. (default: the graph's input schema)
             retry (Optional[RetryPolicy]): The policy for retrying the node. (default: None)
+            destinations (Optional[Union[dict[str, str], tuple[str]]]): Destinations that indicate where a node can route to.
+                This is useful for edgeless graphs with nodes that return `Command` objects.
+                If a dict is provided, the keys will be used as the target node names and the values will be used as the labels for the edges.
+                If a tuple is provided, the values will be used as the target node names.
+                NOTE: this is only used for graph rendering and doesn't have any effect on the graph execution.
         Raises:
             ValueError: If the key is already being used as a state key.
-
 
         Examples:
             ```pycon
@@ -320,7 +325,7 @@ class StateGraph(Graph):
             ```
 
         Returns:
-            StateGraph
+            Self: The instance of the state graph, allowing for method chaining.
         """
         if not isinstance(node, str):
             action = node
@@ -359,9 +364,13 @@ class StateGraph(Graph):
                     f"'{character}' is a reserved character and is not allowed in the node names."
                 )
 
-        ends = EMPTY_SEQ
+        ends: Union[tuple[str, ...], dict[str, str]] = EMPTY_SEQ
         try:
-            if (isfunction(action) or ismethod(getattr(action, "__call__", None))) and (
+            if (
+                isfunction(action)
+                or ismethod(action)
+                or ismethod(getattr(action, "__call__", None))
+            ) and (
                 hints := get_type_hints(getattr(action, "__call__"))
                 or get_type_hints(action)
             ):
@@ -376,16 +385,33 @@ class StateGraph(Graph):
                     if input_hint := hints.get(first_parameter_name):
                         if isinstance(input_hint, type) and get_type_hints(input_hint):
                             input = input_hint
-                if (
-                    (rtn := hints.get("return"))
-                    and get_origin(rtn) is Command
-                    and (rargs := get_args(rtn))
-                    and get_origin(rargs[0]) is Literal
-                    and (vals := get_args(rargs[0]))
-                ):
-                    ends = vals
+                if rtn := hints.get("return"):
+                    # Handle Union types
+                    rtn_origin = get_origin(rtn)
+                    if rtn_origin is Union:
+                        rtn_args = get_args(rtn)
+                        # Look for Command in the union
+                        for arg in rtn_args:
+                            arg_origin = get_origin(arg)
+                            if arg_origin is Command:
+                                rtn = arg
+                                rtn_origin = arg_origin
+                                break
+
+                    # Check if it's a Command type
+                    if (
+                        rtn_origin is Command
+                        and (rargs := get_args(rtn))
+                        and get_origin(rargs[0]) is Literal
+                        and (vals := get_args(rargs[0]))
+                    ):
+                        ends = vals
         except (TypeError, StopIteration):
             pass
+
+        if destinations is not None:
+            ends = destinations
+
         if input is not None:
             self._add_schema(input)
         self.nodes[cast(str, node)] = StateNodeSpec(
@@ -412,7 +438,7 @@ class StateGraph(Graph):
             ValueError: If the start key is 'END' or if the start key or end key is not present in the graph.
 
         Returns:
-            StateGraph
+            Self: The instance of the state graph, allowing for method chaining.
         """
         if isinstance(start_key, str):
             return super().add_edge(start_key, end_key)
@@ -451,7 +477,7 @@ class StateGraph(Graph):
             ValueError: if the sequence contains duplicate node names.
 
         Returns:
-            StateGraph
+            Self: The instance of the state graph, allowing for method chaining.
         """
         if len(nodes) < 1:
             raise ValueError("Sequence requires at least one node.")
@@ -485,6 +511,7 @@ class StateGraph(Graph):
         interrupt_before: Optional[Union[All, list[str]]] = None,
         interrupt_after: Optional[Union[All, list[str]]] = None,
         debug: bool = False,
+        name: Optional[str] = None,
     ) -> "CompiledStateGraph":
         """Compiles the state graph into a `CompiledGraph` object.
 
@@ -555,6 +582,7 @@ class StateGraph(Graph):
             auto_validate=False,
             debug=debug,
             store=store,
+            name=name or "LangGraph",
         )
 
         compiled.attach_node(START, None)
@@ -647,7 +675,9 @@ class CompiledStateGraph(CompiledGraph):
             elif isinstance(input, Command):
                 if input.graph == Command.PARENT:
                     return None
-                return input._update_as_tuples()
+                return [
+                    (k, v) for k, v in input._update_as_tuples() if k in output_keys
+                ]
             elif (
                 isinstance(input, (list, tuple))
                 and input
@@ -658,15 +688,30 @@ class CompiledStateGraph(CompiledGraph):
                     if isinstance(i, Command):
                         if i.graph == Command.PARENT:
                             continue
-                        updates.extend(i._update_as_tuples())
+                        updates.extend(
+                            (k, v) for k, v in i._update_as_tuples() if k in output_keys
+                        )
                     else:
                         updates.extend(_get_updates(i) or ())
                 return updates
             elif get_type_hints(type(input)):
+                # if input is a Pydantic model, only update values
+                # for the keys that have been explicitly set by the users
+                # (this is needed to avoid sending updates for fields with None defaults)
+                output_keys_ = output_keys
+                # Pydantic v2
+                if hasattr(input, "model_fields_set"):
+                    output_keys_ = [
+                        k for k in output_keys if k in input.model_fields_set
+                    ]
+                # Pydantic v1
+                elif hasattr(input, "__fields_set__"):
+                    output_keys_ = [k for k in output_keys if k in input.__fields_set__]
+
                 return [
                     (k, getattr(input, k))
-                    for k in output_keys
-                    if getattr(input, k, None) is not None
+                    for k in output_keys_
+                    if getattr(input, k, MISSING) is not MISSING
                 ]
             else:
                 msg = create_error_message(
@@ -844,14 +889,10 @@ def _control_branch(value: Any) -> Sequence[Union[str, Send]]:
     commands: list[Command] = []
     if isinstance(value, Command):
         commands.append(value)
-    elif (
-        isinstance(value, (list, tuple))
-        and value
-        and all(isinstance(i, Command) for i in value)
-    ):
-        commands.extend(value)
-    else:
-        return EMPTY_SEQ
+    elif isinstance(value, (list, tuple)):
+        for cmd in value:
+            if isinstance(cmd, Command):
+                commands.append(cmd)
     rtn: list[Union[str, Send]] = []
     for command in commands:
         if command.graph == Command.PARENT:
@@ -871,14 +912,10 @@ async def _acontrol_branch(value: Any) -> Sequence[Union[str, Send]]:
     commands: list[Command] = []
     if isinstance(value, Command):
         commands.append(value)
-    elif (
-        isinstance(value, (list, tuple))
-        and value
-        and all(isinstance(i, Command) for i in value)
-    ):
-        commands.extend(value)
-    else:
-        return EMPTY_SEQ
+    elif isinstance(value, (list, tuple)):
+        for cmd in value:
+            if isinstance(cmd, Command):
+                commands.append(cmd)
     rtn: list[Union[str, Send]] = []
     for command in commands:
         if command.graph == Command.PARENT:

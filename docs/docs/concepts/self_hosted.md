@@ -11,7 +11,7 @@ There are two versions of the self-hosted deployment: [Self-Hosted Enterprise](.
 
 ### Self-Hosted Lite
 
-The Self-Hosted Lite version is a limited version of LangGraph Platform that you can run locally or in a self-hosted manner (up to 1 million nodes executed).
+The Self-Hosted Lite version is a limited version of LangGraph Platform that you can run locally or in a self-hosted manner (up to 1 million nodes executed per year).
 
 When using the Self-Hosted Lite version, you authenticate with a [LangSmith](https://smith.langchain.com/) API key.
 
@@ -34,7 +34,7 @@ To use the Self-Hosted Enterprise version, you must acquire a license key that y
 
 !!! warning "Note"
 
-    The LangGraph Platform Deployments view (within LangSmith SaaS and self-hosted LangSmith) is not available for Self-Hosted Lite or Self-Hosted Enterprise LangGraph deployments. Self-hosted LangGraph deployments are managed externally from LangSmith (e.g. there is no UI to manage these deployments).
+    The LangGraph Platform Deployments view is optionally available for Self-Hosted LangGraph deployments. With one click, self-hosted LangGraph deployments can be deployed in the same Kubernetes cluster where a self-hosted LangSmith instance is deployed.
 
 For step-by-step instructions, see [How to set up a self-hosted deployment of LangGraph](../how-tos/deploy-self-hosted.md).
 
